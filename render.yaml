@@ -2,15 +2,14 @@ services:
   - type: web
     name: uid-ops-backend
     env: node
-    plan: free
-    buildCommand: "npm ci"
+    buildCommand: "npm install"
     startCommand: "node server.js"
-    disk:
-      name: data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
-      - key: DB_PATH
-        value: /var/data/uid_ops.sqlite
-      - key: CORS_ORIGIN
-        value: "*"
+      - key: ALLOWED_ORIGIN
+        value: https://<your-netlify-site>.netlify.app
+      - key: DB_DIR
+        value: /var/data
+    disks:
+      - name: data
+        mountPath: /var/data
+        sizeGB: 1

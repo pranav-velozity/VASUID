@@ -1,20 +1,30 @@
-// server.js — UID Ops Backend MVP
-// Run locally: npm install && node server.js
-// Env:
-//   PORT=4000 (default)
-//   DB_PATH=/var/data/uid_ops.sqlite (Render disk) or ./uid_ops.sqlite (local default)
-//   CORS_ORIGIN=*  (set to your Netlify URL in prod)
+// server.js — UID Ops Backend (Express + SQLite)
+// Run locally:
+//   1) npm install
+//   2) npm start
+// Frontend env: VITE_API_BASE=http://localhost:4000 (or use the <meta name="api-base">)
+
+// Deps
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const ExcelJS = require('exceljs');
 const Database = require('better-sqlite3');
 
-const app = express();
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
-app.use(express.json());
-
+// ---- Config ----
 const PORT = process.env.PORT || 4000;
-const DB_PATH = process.env.DB_PATH || 'uid_ops.sqlite';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*'; // set to your Netlify domain in production
+
+// SQLite file (works locally; on Render, mount a persistent disk and set DB_DIR=/var/data)
+const DB_DIR = process.env.DB_DIR || path.join(__dirname, 'data');
+fs.mkdirSync(DB_DIR, { recursive: true });
+const DB_FILE = process.env.DB_FILE || path.join(DB_DIR, 'uid_ops.sqlite');
+
+// ---- App ----
+const app = express();
+app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN }));
+app.use(express.json({ limit: '10mb' }));
 
 // --- Time helpers (America/Chicago) ---
 function chicagoISOFromDate(d = new Date()) {
@@ -32,9 +42,10 @@ function chicagoISOFromDate(d = new Date()) {
 }
 const todayChicagoISO = () => chicagoISOFromDate(new Date());
 
-// --- DB setup ---
-const db = new Database(DB_PATH);
+// --- DB setup ----
+const db = new Database(DB_FILE);
 db.pragma('journal_mode = WAL');
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS records (
   id TEXT PRIMARY KEY,
@@ -52,24 +63,41 @@ CREATE INDEX IF NOT EXISTS idx_records_date ON records(date_local);
 CREATE INDEX IF NOT EXISTS idx_records_status ON records(status);
 CREATE INDEX IF NOT EXISTS idx_records_po ON records(po_number);
 CREATE INDEX IF NOT EXISTS idx_records_sku ON records(sku_code);
+
+-- Weekly plans per week_start (YYYY-MM-DD). Store plan rows as JSON string.
+CREATE TABLE IF NOT EXISTS plans (
+  week_start TEXT PRIMARY KEY,
+  data TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `);
 
-const selectById = db.prepare('SELECT * FROM records WHERE id = ?');
-const insertBase = db.prepare(`INSERT INTO records (id, date_local, status, sync_state) VALUES (?, ?, 'draft', 'pending')`);
-const updateField = db.prepare(`UPDATE records SET
-  date_local = COALESCE(?, date_local),
-  mobile_bin = COALESCE(?, mobile_bin),
-  sscc_label = COALESCE(?, sscc_label),
-  po_number = COALESCE(?, po_number),
-  sku_code = COALESCE(?, sku_code),
-  uid = COALESCE(?, uid),
-  status = COALESCE(?, status),
-  completed_at = COALESCE(?, completed_at),
-  sync_state = COALESCE(?, sync_state)
-  WHERE id = ?`);
+const selectRecordById = db.prepare('SELECT * FROM records WHERE id = ?');
+const insertRecordBase = db.prepare(
+  `INSERT INTO records (id, date_local, status, sync_state)
+   VALUES (?, ?, 'draft', 'pending')`
+);
+const updateRecordFields = db.prepare(
+  `UPDATE records SET
+     date_local   = COALESCE(?, date_local),
+     mobile_bin   = COALESCE(?, mobile_bin),
+     sscc_label   = COALESCE(?, sscc_label),
+     po_number    = COALESCE(?, po_number),
+     sku_code     = COALESCE(?, sku_code),
+     uid          = COALESCE(?, uid),
+     status       = COALESCE(?, status),
+     completed_at = COALESCE(?, completed_at),
+     sync_state   = COALESCE(?, sync_state)
+   WHERE id = ?`
+);
 
 function isComplete(row) {
-  return Boolean((row?.po_number||'').trim() && (row?.sku_code||'').trim() && (row?.uid||'').trim() && (row?.mobile_bin||'').trim());
+  return Boolean(
+    (row?.po_number || '').trim() &&
+    (row?.sku_code  || '').trim() &&
+    (row?.uid       || '').trim() &&
+    (row?.mobile_bin|| '').trim()
+  );
 }
 
 // --- SSE hub for cardio ---
@@ -82,10 +110,12 @@ function emitScan(ts = new Date()) {
 }
 
 app.get('/events/scan', (req, res) => {
+  // include CORS for SSE explicitly
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': ALLOWED_ORIGIN
   });
   res.write('\n');
   clients.add(res);
@@ -96,7 +126,7 @@ app.get('/events/scan', (req, res) => {
 app.get('/health', (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
 
 // --- Records API ---
-// Upsert via PATCH (frontend sends field + value)
+// Upsert via PATCH (frontend sends { field, value })
 app.patch('/records/:id', (req, res) => {
   const id = String(req.params.id);
   const { field, value } = req.body || {};
@@ -105,20 +135,20 @@ app.patch('/records/:id', (req, res) => {
   const allowed = new Set(['date_local', 'mobile_bin', 'sscc_label', 'po_number', 'sku_code', 'uid']);
   if (!allowed.has(field)) return res.status(400).json({ error: `Invalid field: ${field}` });
 
-  let row = selectById.get(id);
+  let row = selectRecordById.get(id);
   if (!row) {
-    insertBase.run(id, todayChicagoISO());
-    row = selectById.get(id);
+    insertRecordBase.run(id, todayChicagoISO());
+    row = selectRecordById.get(id);
   }
 
   // Prepare updated values
-  const newRow = { ...row };
-  if (field === 'date_local') newRow.date_local = String(value||'') || todayChicagoISO();
-  if (field === 'mobile_bin') newRow.mobile_bin = String(value||'');
-  if (field === 'sscc_label') newRow.sscc_label = String(value||'');
-  if (field === 'po_number') newRow.po_number = String(value||'');
-  if (field === 'sku_code') newRow.sku_code = String(value||'');
-  if (field === 'uid') newRow.uid = String(value||'');
+  const next = { ...row };
+  if (field === 'date_local') next.date_local = String(value || '') || todayChicagoISO();
+  if (field === 'mobile_bin') next.mobile_bin = String(value || '');
+  if (field === 'sscc_label') next.sscc_label = String(value || '');
+  if (field === 'po_number')  next.po_number  = String(value || '');
+  if (field === 'sku_code')   next.sku_code   = String(value || '');
+  if (field === 'uid')        next.uid        = String(value || '');
 
   // Determine completion
   let completed_at = row.completed_at;
@@ -129,24 +159,23 @@ app.patch('/records/:id', (req, res) => {
   if (willBeComplete && row.status !== 'complete') {
     status = 'complete';
     completed_at = new Date().toISOString();
-    // Notify SSE listeners
-    emitScan(new Date(completed_at));
+    emitScan(new Date(completed_at)); // notify SSE listeners
   }
 
-  updateField.run(
-    newRow.date_local || row.date_local || todayChicagoISO(),
-    newRow.mobile_bin ?? null,
-    newRow.sscc_label ?? null,
-    newRow.po_number ?? null,
-    newRow.sku_code ?? null,
-    newRow.uid ?? null,
+  updateRecordFields.run(
+    next.date_local || row.date_local || todayChicagoISO(),
+    next.mobile_bin ?? null,
+    next.sscc_label ?? null,
+    next.po_number  ?? null,
+    next.sku_code   ?? null,
+    next.uid        ?? null,
     status,
-    completed_at ?? null,
+    completed_at    ?? null,
     sync_state,
     id
   );
 
-  const after = selectById.get(id);
+  const after = selectRecordById.get(id);
   return res.json({ ok: true, record: after });
 });
 
@@ -155,11 +184,11 @@ app.get('/records', (req, res) => {
   const { from, to, status, limit } = req.query;
   const params = [];
   let sql = 'SELECT * FROM records WHERE 1=1';
-  if (from) { sql += ' AND date_local >= ?'; params.push(String(from)); }
-  if (to) { sql += ' AND date_local <= ?'; params.push(String(to)); }
-  if (status) { sql += ' AND status = ?'; params.push(String(status)); }
+  if (from)   { sql += ' AND date_local >= ?'; params.push(String(from)); }
+  if (to)     { sql += ' AND date_local <= ?'; params.push(String(to)); }
+  if (status) { sql += ' AND status = ?';      params.push(String(status)); }
   sql += ' ORDER BY completed_at DESC';
-  if (limit) { sql += ' LIMIT ?'; params.push(Number(limit)); }
+  if (limit)  { sql += ' LIMIT ?';             params.push(Number(limit)); }
   const rows = db.prepare(sql).all(...params);
   res.json({ records: rows });
 });
@@ -187,7 +216,58 @@ app.get('/export/xlsx', async (req, res) => {
   res.end();
 });
 
+// ---------- Weekly Plan API (team-wide persistence) ----------
+
+// Normalize plan rows; require po_number, sku_code, due_date; allow start_date/target_qty, etc.
+function normalizePlanArray(body, fallbackStart) {
+  if (!Array.isArray(body)) return [];
+  const norm = body.map(r => ({
+    po_number: String(r?.po_number ?? '').trim(),
+    sku_code:  String(r?.sku_code  ?? '').trim(),
+    start_date: (String(r?.start_date ?? '').trim()) || fallbackStart || '',
+    due_date:   String(r?.due_date   ?? '').trim(),
+    target_qty: Number(r?.target_qty ?? 0) || 0,
+    priority:   r?.priority ? String(r.priority).trim() : undefined,
+    notes:      r?.notes ? String(r.notes).trim() : undefined,
+  })).filter(r => r.po_number && r.sku_code && r.due_date);
+  return norm;
+}
+
+// GET: read plan for a given monday (week start)
+app.get('/plan/weeks/:mondayISO', (req, res) => {
+  const monday = String(req.params.mondayISO);
+  const row = db.prepare('SELECT data FROM plans WHERE week_start = ?').get(monday);
+  if (!row) return res.json([]);
+  try {
+    const data = JSON.parse(row.data);
+    return res.json(Array.isArray(data) ? data : []);
+  } catch {
+    return res.json([]);
+  }
+});
+
+// PUT: replace plan for a given monday (idempotent)
+app.put('/plan/weeks/:mondayISO', (req, res) => {
+  const monday = String(req.params.mondayISO);
+  const arr = normalizePlanArray(req.body, monday);
+  const json = JSON.stringify(arr);
+  db.prepare(`
+    INSERT INTO plans(week_start, data, updated_at)
+    VALUES(?, ?, datetime('now'))
+    ON CONFLICT(week_start) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at
+  `).run(monday, json);
+  return res.json(arr);
+});
+
+// (Optional) list recent weeks with plans
+app.get('/plan/weeks', (req, res) => {
+  const rows = db.prepare(`SELECT week_start, updated_at FROM plans ORDER BY week_start DESC LIMIT 52`).all();
+  res.json(rows);
+});
+
+// ---- Start ----
 app.listen(PORT, () => {
   console.log(`UID Ops backend listening on http://localhost:${PORT}`);
-  console.log(`DB at: ${DB_PATH}`);
+  console.log(`DB file: ${DB_FILE}`);
+  console.log(`CORS origin: ${ALLOWED_ORIGIN}`);
 });
